@@ -1,8 +1,10 @@
-from collections import OrderedDict
+#!/usr/bin/env python3
+import json
 import logging
 import re
 
-from typing import Dict, List, NamedTuple, Optional, Union
+from functools import lru_cache
+from typing import Dict, Optional, NamedTuple, Any, Callable
 
 from requests import Session
 
@@ -10,6 +12,7 @@ from requests import Session
 USER_AGENT = "Mozilla/5.0"
 
 BASE_URL = "https://twitter.com"
+COOKIE_DOMAIN = ".twitter.com"
 LOGIN_FLOW_URL = "https://api.twitter.com/1.1/onboarding/task.json"
 GUEST_TOKEN_ACTIVATE_URL = "https://api.twitter.com/1.1/guest/activate.json"
 
@@ -18,21 +21,43 @@ RE_OAUTH_TOKEN_MAIN_JS = re.compile(r"\"(AAAAAA[^,.\s\"]{80,})\"")
 
 
 StrDict = Dict[str, str]
-Json = Dict[str, Union['Json', List['Json'], str, float, int, None]]
+AnyDict = Dict[str, Any]
+FnDict = Dict[str, Callable]
 
 
-class _LoginFlowStep(NamedTuple):
-    data: Json
+LOG = logging.getLogger("twatter")
+
+
+class LoginFlowRequest(NamedTuple):
+    data: AnyDict
     query: Optional[StrDict] = None
 
-
-class _LoginFlowStepResponse(NamedTuple):
-    flow_token: str
-    subtasks: Json
+    def as_dict(self) -> AnyDict:
+        return dict(json=self.data, params=self.query or dict())
 
 
-def _create_start_step() -> _LoginFlowStep:
-    return _LoginFlowStep(
+class LoginFlowResponse(NamedTuple):
+    token: str
+    subtasks: Dict[str, AnyDict]
+
+    @staticmethod
+    def from_response(raw: AnyDict) -> 'LoginFlowResponse':
+        return LoginFlowResponse(
+            token=raw["flow_token"],
+            subtasks={subtask.pop("subtask_id"): subtask for subtask in raw["subtasks"]}
+        )
+
+
+class LoggedInUser(NamedTuple):
+    user_id: str
+    oauth_token: str
+    guest_token: str
+    auth_token: str
+    csrf_token: str
+
+
+def login_flow_start(**_) -> LoginFlowRequest:
+    return LoginFlowRequest(
         data={
             "input_flow_data": {
                 "flow_context": {
@@ -92,8 +117,8 @@ def _create_start_step() -> _LoginFlowStep:
     )
 
 
-def _create_js_instrumentation_step(token: str) -> _LoginFlowStep:
-    return _LoginFlowStep({
+def login_flow_js_instrumentation(token: str, **_) -> LoginFlowRequest:
+    return LoginFlowRequest({
         "flow_token": token,
         "subtask_inputs": [{
             "subtask_id": "LoginJsInstrumentationSubtask",
@@ -105,8 +130,8 @@ def _create_js_instrumentation_step(token: str) -> _LoginFlowStep:
     })
 
 
-def _create_account_duplication_check_step(token: str) -> _LoginFlowStep:
-    return _LoginFlowStep({
+def login_flow_account_duplication_check(token: str, **_) -> LoginFlowRequest:
+    return LoginFlowRequest({
         "flow_token": token,
         "subtask_inputs": [{
             "subtask_id": "AccountDuplicationCheck",
@@ -117,8 +142,8 @@ def _create_account_duplication_check_step(token: str) -> _LoginFlowStep:
     })
 
 
-def _create_enter_username_step(token: str, username: str) -> _LoginFlowStep:
-    return _LoginFlowStep({
+def login_flow_enter_username(token: str, username: str, **_) -> LoginFlowRequest:
+    return LoginFlowRequest({
         "flow_token": token,
         "subtask_inputs": [{
             "subtask_id": "LoginEnterUserIdentifierSSO",
@@ -137,8 +162,8 @@ def _create_enter_username_step(token: str, username: str) -> _LoginFlowStep:
     })
 
 
-def _create_enter_password_step(token: str, password: str) -> _LoginFlowStep:
-    return _LoginFlowStep({
+def login_flow_enter_password(token: str, password: str, **_) -> LoginFlowRequest:
+    return LoginFlowRequest({
         "flow_token": token,
         "subtask_inputs": [{
             "subtask_id": "LoginEnterPassword",
@@ -150,8 +175,8 @@ def _create_enter_password_step(token: str, password: str) -> _LoginFlowStep:
     })
 
 
-def _create_enter_email_step(token: str, email: str) -> _LoginFlowStep:
-    return _LoginFlowStep({
+def login_flow_enter_email(token: str, email: str, **_) -> LoginFlowRequest:
+    return LoginFlowRequest({
         "flow_token": token,
         "subtask_inputs": [{
             "subtask_id": "LoginAcid",
@@ -163,109 +188,130 @@ def _create_enter_email_step(token: str, email: str) -> _LoginFlowStep:
     })
 
 
-def _submit_login_flow_step(http: Session, headers: StrDict, step: _LoginFlowStep) -> _LoginFlowStepResponse:
-    response = http.post(LOGIN_FLOW_URL, headers=headers, params=step.query or {}, json=step.data)
+def execute_login_flow_request(http: Session, headers: StrDict, step: LoginFlowRequest) -> LoginFlowResponse:
+    response = http.post(LOGIN_FLOW_URL, headers=headers, **step.as_dict())
     response.raise_for_status()
     result = response.json()
-    if result.get('status') != 'success':
-        raise RuntimeError(f'failed to submit login flow step: {response.text}')
-    return _LoginFlowStepResponse(
-        flow_token=result.get('flow_token'),
-        subtasks={
-            subtask.pop('subtask_id'): subtask
-            for subtask in result.get('subtasks')
-        },
-    )
+    if result.get("status") != "success":
+        raise RuntimeError(f"failed to submit login flow step: {response.text}")
+    return LoginFlowResponse.from_response(result)
 
 
-def extract_twitter_cookie(http: Session, name: str) -> Optional[str]:
-    return http.cookies.get_dict(domain='.twitter.com').get(name)
-
-
-def get_oauth_token(http: Session) -> str:
-    home_page = http.get(BASE_URL)
-    home_page.raise_for_status()
-    main_js_url = next(RE_MAIN_JS_URL.finditer(home_page.text)).group(1)
-    main_js_source = http.get(main_js_url)
-    main_js_source.raise_for_status()
-    return f'Bearer {next(RE_OAUTH_TOKEN_MAIN_JS.finditer(main_js_source.text)).group(1)}'
-
-
-def get_guest_token(http: Session, oauth_token: str) -> str:
-    activate_result = http.post(
-        GUEST_TOKEN_ACTIVATE_URL,
-        headers={
-            'Content-Type': 'application/json',
-            'Authorization': oauth_token
-        }
-    )
-    activate_result.raise_for_status()
-    return activate_result.json().get('guest_token')
-
-
-def get_auth_token(
+def run_login_flow(
     http: Session,
     oauth_token: str,
     guest_token: str,
+    email: str,
     username: str,
     password: str,
-    email: str,
-) -> str:
+    custom_step_handlers: Optional[FnDict],
+) -> AnyDict:
     headers = {
-        'Content-Type': 'application/json',
-        'Authorization': oauth_token,
-        'X-Guest-Token': guest_token,
-        'X-Twitter-Active-User': 'yes',
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {oauth_token}",
+        "X-Guest-Token": guest_token,
+        "X-Twitter-Active-User": "yes",
     }
-
-    flow_steps = OrderedDict(
+    flow_steps = dict(
         LoginSuccessSubtask=None,
-        LoginJsInstrumentationSubtask=lambda token: _create_js_instrumentation_step(token),
-        AccountDuplicationCheck=lambda token: _create_account_duplication_check_step(token),
-        LoginEnterUserIdentifierSSO=lambda token: _create_enter_username_step(token, username),
-        LoginEnterPassword=lambda token: _create_enter_password_step(token, password),
-        LoginAcid=lambda token: _create_enter_email_step(token, email),
+        LoginJsInstrumentationSubtask=login_flow_js_instrumentation,
+        AccountDuplicationCheck=login_flow_account_duplication_check,
+        LoginEnterUserIdentifierSSO=login_flow_enter_username,
+        LoginEnterPassword=login_flow_enter_password,
+        LoginAcid=login_flow_enter_email,
     )
+    flow_steps.update(custom_step_handlers or dict())
+    step_id = 1
+    step_name = "Start"
+    step = login_flow_start
+    response = None
+    next_step_name = None
+    context = dict(email=email, username=username, password=password)
+    while step is not None:
+        request = step(**context)
+        response = execute_login_flow_request(http, headers, request)
+        context["response"], context["token"] = response, response.token  # type: ignore
+        next_step_name, step = next(filter(lambda el: el[0] in response.subtasks, flow_steps.items()))  # type: ignore
+        LOG.debug("[%s] ✅ %s -> %s", step_id, step_name, next_step_name)
+        step_id += 1
+        step_name = next_step_name  # type: ignore
+    return response.subtasks[next_step_name]
 
-    step = 0
-    step_name = 'Start'
-    response = _submit_login_flow_step(http, headers, _create_start_step())
-    while True:
-        next_step_name, task = next(filter(lambda el: el[0] in response.subtasks, flow_steps.items()))
-        logging.info(f'[{step}] ✅ {step_name} -> {next_step_name}')
-        if task is None:
-            break
-        step += 1
-        step_name, response = next_step_name, _submit_login_flow_step(http, headers, task(response.flow_token))
-    return extract_twitter_cookie(http, 'auth_token')
+
+def get_oauth_token(http: Session) -> str:
+    """
+    Retrieves publicly available oauth_token from Twitter frontend source code.
+    """
+    # this is needed to initiate Twitter cookies, so we do this request every time.
+    home_page = http.get(BASE_URL)
+    home_page.raise_for_status()
+
+    @lru_cache()
+    def _get_token(main_js_url):
+        # this request can safely be cached, as token from the file can only change if the url changes.
+        main_js_source = http.get(main_js_url)
+        main_js_source.raise_for_status()
+        return next(RE_OAUTH_TOKEN_MAIN_JS.finditer(main_js_source.text)).group(1)
+
+    main_js_url = next(RE_MAIN_JS_URL.finditer(home_page.text)).group(1)
+    return _get_token(main_js_url)
 
 
-def auth_ex(http: Session, username: str, password: str, email: str) -> StrDict:
+def get_guest_token(http: Session, oauth_token: str, guest_id: Optional[str] = None) -> str:
+    """
+    Exchanges `guest_id` for guest_token.
+    If guest_id is not provided, it is assumed to be already present in session cookies.
+    """
+    if guest_id is not None:
+        http.cookies.set("guest_id", guest_id, domain=COOKIE_DOMAIN)
+    response = http.post(
+        GUEST_TOKEN_ACTIVATE_URL,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {oauth_token}",
+        },
+    )
+    response.raise_for_status()
+    return response.json().get("guest_token")
+
+
+def login_ex(
+    http: Session,
+    email: str,
+    username: str,
+    password: str,
+    custom_step_handlers: Optional[FnDict] = None,
+) -> LoggedInUser:
+    """
+    Logs into Twitter using provided credentials. Additional handlers for login flow can be provided.
+    """
     oauth_token = get_oauth_token(http)
+    LOG.debug("✅ oauth_token = %s", oauth_token)
     guest_token = get_guest_token(http, oauth_token)
-    auth_token = get_auth_token(http, oauth_token, guest_token, username, password, email)
-    csrf_token = extract_twitter_cookie(http, 'ct0')
-    return dict(
-        oauth_token=oauth_token,
-        guest_token=guest_token,
-        auth_token=auth_token,
-        csrf_token=csrf_token
-    )
+    LOG.debug("✅ guest_token = %s", guest_token)
+    success_subtask = run_login_flow(http, oauth_token, guest_token, email, username, password, custom_step_handlers)
+    LOG.debug("✅ login flow returned %s", json.dumps(success_subtask))
+    user_id = str(success_subtask["open_account"]["user"]["id_str"])
+    cookies = http.cookies.get_dict(domain=COOKIE_DOMAIN)
+    auth_token = cookies["auth_token"]
+    csrf_token = cookies["ct0"]
+    LOG.debug("✅ auth_token = %s, csrf_token (ct0) = %s", auth_token, csrf_token)
+    return LoggedInUser(user_id, oauth_token, guest_token, auth_token, csrf_token)
 
 
-def auth(username: str, password: str, email: str) -> StrDict:
+def login(email: str, username: str, password: str) -> LoggedInUser:
     with Session() as http:
-        http.headers['User-Agent'] = USER_AGENT
-        return auth_ex(http, username, password, email)
+        http.headers["User-Agent"] = USER_AGENT
+        return login_ex(http, email, username, password)
 
 
 def _cli_main():
     import os
-    import json
-    logging.basicConfig(level='INFO')
-    email, username, password = os.environ['TWITTER_LOGIN_DATA'].split(':', maxsplit=3)
-    print(json.dumps(auth(username, password, email)))
+    import sys
+    logging.basicConfig(level="DEBUG", stream=sys.stderr)
+    result = login(*os.environ["TWITTER_LOGIN_DATA"].split(":", maxsplit=3))
+    print(json.dumps(result._asdict(), indent=2))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     _cli_main()

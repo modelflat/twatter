@@ -1,2 +1,5 @@
 __pycache__
-set-env.ps1
+.mypy_cache
+venv
+
+set-env.*
