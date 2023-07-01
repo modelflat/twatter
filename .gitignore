@@ -3,3 +3,7 @@ __pycache__
 venv
 
 set-env.*
+gmail_credentials.json
+gmail_tokens.json
+
+NOTES.md
